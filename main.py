@@ -4,9 +4,9 @@ import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import AsyncOpenAI
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Union, Optional
 from dotenv import load_dotenv
-from charts_config import charts_config, minimal_config, chart_requirements
+from charts_config import charts_config
 
 # --- Load .env ---
 load_dotenv()
@@ -27,194 +27,210 @@ CLIENT = AsyncOpenAI(
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Chart Generation Assistant API",
-    description="An API that suggests charts based on user prompts and maps data schemas to them.",
-    version="1.0.0"
+    description="An API that suggests charts and builds queries based on user prompts and metadata.",
+    version="2.0.0"
 )
 
+# --- Logic Classes (Adapted from prompt2.py) ---
 
-# --- Pydantic Models for API Validation ---
-
-# Models for /choose-charts
-class ChooseChartRequest(BaseModel):
-    user_prompt: str
-
-class ChartChoice(BaseModel):
-    name: str
-
-class ChooseChartResponse(BaseModel):
-    chosen_charts: List[ChartChoice]
-
-# Models for /map-schema
-class MapSchemaRequest(BaseModel):
-    user_prompt: str
-    chosen_charts: List[ChartChoice]
-    schema_definition: Dict[str, Any] # e.g., {"columns": {"Region": "string", "Sales": "number"}}
-
-class MappedChartStructure(BaseModel):
-    # This is highly dynamic, so we allow extra fields
-    class Config:
-        extra = 'allow'
-
-class MappedChart(BaseModel):
-    name: str
-    structure: Dict[str, Any] # Using Dict[str, Any] for flexibility
-
-class MapSchemaResponse(BaseModel):
-    charts: List[MappedChart]
-
-
-# --- Core Logic Functions 
-async def choose_chart_logic(user_prompt: str, model: str = MODEL) -> str:
-    """Calls OpenAI API to choose charts based on a user prompt."""
-    system_prompt = """
-      You are a data visualization assistant.
-      You are given a list of chart configurations (with name, why, and use_cases).
-      Your task is:
-      1. Read the user request carefully.
-      2. Compare it with the provided chart configurations.
-      3. You must choose ALL charts that are relevant to the user's request, not just the most obvious one.
-      4. If no chart is relevant, return {"chosen_charts": []}.
-      5. Return ONLY the chosen charts as JSON in this format:
-
-      {
-        "chosen_charts": [
-          {
-            "name": "<chart_name>"
-          }
-        ]
-      }
-
-      Return JSON ONLY. No extra text, no markdown, no explanations.
-      """
-
-    try:
-        response = await CLIENT.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"User request: {user_prompt}\n\nCharts config: {json.dumps(minimal_config, indent=0)}"}
-            ],
-            temperature=0,
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error calling OpenAI API: {str(e)}")
-
-async def map_schema_to_charts_logic(user_prompt: str, chosen_charts: List[Dict], schema: Dict, model: str = MODEL) -> Dict:
-    """Calls OpenAI API to map schema columns to chart requirements."""
-    schema_mapping_prompt = """
-    Your task:
-    - For each chart, suggest the best mapping of schema columns to the chart's data requirements.
-    - Use the user's request to understand what columns matter (e.g., "sales by region" → x_axis=region, y_axis=SUM(sales)).
-    - Infer derived metrics from the request if needed (e.g., "profit margin" → profit/sales, "GDP per capita" → gdp/population, "average sales" → AVG(sales)).
-    - Fill missing numeric axes with sensible aggregations (COUNT, SUM, AVG) if the user implicitly asks for summaries.
-    - Include optional fields (color, size, labels, series) if a suitable column exists in the schema to enrich the visualization.
-    - For charts with multiple metrics, suggest series as structured objects: {"name": "<metric_name>", "metric": "<column or expression>"}.
-    - Handle time-based columns smartly: infer month, quarter, year, or week if the user mentions a trend.
-    - Only assign schema columns that exist in the dataset.
-    - If no suitable column is found for a requirement, set it to null.
-    - Some charts may not need x/y axes (e.g., pie, radar, word cloud, treemap). In those cases, fill only the relevant requirements; optional fields may be added if useful.
-    - Avoid generic nulls for optional enrichment fields if a categorical column exists; use the first suitable column.
-    - Return ONLY JSON in this format:
-
-    {
-      "charts": [
-        {
-          "name": "<chart_name>",
-          "structure": {
-            "<requirement_1>": "<column_name, expression, or null>",
-            "<requirement_2>": "<column_name, expression, or null>",
-            "<requirement_3>": "<column_name, expression, or null>",
-            "optional": {
-              "color": "<column_name or null>",
-              "size": "<column_name or null>",
-              "labels": "<column_name or null>",
-              "series": [{"name": "<metric_name>", "metric": "<column or expression>"}]
+class ChartSuggester:
+    def __init__(self, charts_config: List[Dict], model: str = MODEL):
+        self.model = model
+        self.minimal_config = [
+            {
+                "id": chart.get("chart_id"),
+                "name": chart.get("name"),
+                "why": chart.get("why"),
+                "use_cases": chart.get("use_cases")
             }
-          }
-        }
-      ]
-    }
-    """
+            for chart in charts_config
+        ]
+        self.system_prompt = """
+        You are a data visualization assistant.
+        You are given a list of chart configurations (id, name, why, use_cases).
+        Your task:
+        1. Read the user's request carefully.
+        2. Compare it with the provided chart configurations.
+        3. Choose ALL charts relevant to the user's request. Do not pick just the most obvious.
+        4. If no chart is relevant, return {"chosen_charts": []}.
+        5. Return ONLY JSON, in this exact format:
 
-    try:
-        response = await CLIENT.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": schema_mapping_prompt},
-                {"role": "user", "content": json.dumps({
-                    "user_request": user_prompt,
-                    "schema": schema,
-                    "chosen_charts": chosen_charts,
-                    "chart_requirements": chart_requirements
-                }, indent=2)}
-            ],
-            temperature=0,
-        )
-        
-        # Try to parse the JSON response from the LLM
-        response_content = response.choices[0].message.content
-        return json.loads(response_content)
-        
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"OpenAI API returned non-JSON response: {response_content}"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error calling OpenAI API: {str(e)}")
+        {
+          "chosen_charts": [
+            {"id": "<chart_id>", "name": "<chart_name>"}
+          ]
+        }
+
+        Do not include any extra text, explanation, or markdown.
+        Do not make assumptions about the dataset yet.
+        """
+
+    async def suggest(self, user_prompts: List[str]) -> List[Dict]:
+        results = []
+
+        for prompt in user_prompts:
+            try:
+                response = await CLIENT.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {
+                            "role": "user",
+                            "content": f"User request: {prompt}\nCharts config: {json.dumps(self.minimal_config, separators=(',', ':'))}"
+                        }
+                    ],
+                    temperature=0,
+                )
+                content = response.choices[0].message.content
+                # Handle potential JSON parsing errors or wrapping
+                try:
+                    chosen_charts = json.loads(content)["chosen_charts"]
+                except (KeyError, json.JSONDecodeError):
+                    # Fallback or empty if parsing failed
+                    chosen_charts = []
+
+                results.append({
+                    "user_prompt": prompt,
+                    "chosen_charts": chosen_charts
+                })
+            except Exception as e:
+                # Log error and return empty for this prompt
+                print(f"Error processing prompt '{prompt}': {e}")
+                results.append({
+                    "user_prompt": prompt,
+                    "chosen_charts": []
+                })
+
+        return results
+
+
+class ChartValidatorAndQueryBuilder:
+    def __init__(self, charts_config: List[Dict], model: str = MODEL):
+        self.model = model
+        self.minimal_config = [
+            {
+                "id": chart.get("chart_id"),
+                "name": chart.get("name"),
+                "data_requirements": chart.get("data_requirements", {}),
+            }
+            for chart in charts_config
+        ]
+        self.system_prompt = """
+        You are a data visualization assistant.
+
+        Your task is to take the dataset metadata, recommended charts (already linked to user prompts),
+        and chart configurations including data requirements.
+
+        For each recommended chart:
+        1. Check if the dataset satisfies its requirements.
+        2. Identify which specific columns should be used for this chart.
+        3. Skip charts that cannot be applied.
+
+        For applicable charts, build a JSON describing the chart with:
+            - user_prompt: the original user request
+            - chart_id
+            - chart_type (name)
+            - query:
+                - source: "uploaded_file"
+                - select: columns with aggregation if needed
+                - filters: (if any applicable from user's request)
+                - group_by: (if applicable)
+                - order_by: (if applicable)
+                - limit: null
+            - encoding: map chart axes to selected columns
+
+        Return ONLY JSON in this format:
+        {
+          "intent": "visualization",
+          "charts": [
+            {
+              "user_prompt": "<original user prompt>",
+              "chart_id": "<id>",
+              "chart_type": "<name>",
+              "query": {
+                "source": "uploaded_file",
+                "select": [],
+                "filters": [],
+                "group_by": [],
+                "order_by": [],
+                "limit": null
+              },
+              "encoding": {"x": "", "y": "", "color": ""}
+            }
+          ]
+        }
+
+        Focus on dataset compatibility and fulfilling the user's request.
+        Do NOT add extra text or explanations.
+        """
+
+    async def build_final_charts(self, dataset_metadata: Dict, recommended_charts_with_prompts: List[Dict]) -> Dict:
+        try:
+            response = await CLIENT.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {
+                        "role": "user",
+                        "content": f"Dataset metadata: {json.dumps(dataset_metadata)}\nRecommended charts with prompts: {json.dumps(recommended_charts_with_prompts)}\nChart configurations: {json.dumps(self.minimal_config)}"
+                    }
+                ],
+                temperature=0,
+            )
+            content = response.choices[0].message.content
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return {"intent": "visualization", "charts": []}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error in Query Builder: {str(e)}")
+
+
+# --- Pydantic Models ---
+
+class SuggestChartsRequest(BaseModel):
+    user_prompts: List[str]
+
+class SuggestChartsResponse(BaseModel):
+    suggestions: List[Dict[str, Any]]
+
+class BuildQueriesRequest(BaseModel):
+    dataset_metadata: Dict[str, Any]
+    suggestions: List[Dict[str, Any]]
+
+class BuildQueriesResponse(BaseModel):
+    intent: str
+    charts: List[Dict[str, Any]]
+
 
 # --- API Endpoints ---
 
 @app.get("/charts-config", summary="Get Full Chart Configuration")
 async def get_charts_config():
-    """
-    Returns the complete `charts_config` JSON object, which includes
-    names, descriptions, use cases, and data requirements for all
-    supported charts.
-    """
+    """Returns the complete charts_config JSON object."""
     return charts_config
 
-@app.post("/choose-charts",
-          response_model=ChooseChartResponse,
-          summary="Suggest Charts from Prompt")
-async def api_choose_charts(request: ChooseChartRequest):
+@app.post("/suggest-charts", response_model=SuggestChartsResponse, summary="Suggest Charts from Prompts")
+async def api_suggest_charts(request: SuggestChartsRequest):
     """
-    Takes a user's natural language prompt and returns a list of
-    suggested chart types that are relevant to the request.
+    Takes a list of natural language prompts and returns suggested chart types 
+    relevant to each request using 'Model 1' logic.
     """
-    json_string = await choose_chart_logic(request.user_prompt)
-    try:
-        data = json.loads(json_string)
-        return data
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"OpenAI API returned non-JSON response: {json_string}"
-        )
+    suggester = ChartSuggester(charts_config)
+    results = await suggester.suggest(request.user_prompts)
+    return {"suggestions": results}
 
-@app.post("/map-schema",
-          response_model=MapSchemaResponse,
-          summary="Map Data Schema to Charts")
-async def api_map_schema(request: MapSchemaRequest):
+@app.post("/build-queries", response_model=BuildQueriesResponse, summary="Validate & Build Chart Queries")
+async def api_build_queries(request: BuildQueriesRequest):
     """
-    Takes a user prompt, a list of chosen charts, and a data schema,
-    and returns a detailed mapping of schema columns to the
-    data requirements for each chart.
+    Takes dataset metadata and suggested charts, validates them against requirements,
+    and builds the final query/encoding JSON using 'Model 2' logic.
     """
-    # Convert Pydantic models back to simple dicts for the logic function
-    chosen_charts_list = [chart.dict() for chart in request.chosen_charts]
-    
-    data = await map_schema_to_charts_logic(
-        user_prompt=request.user_prompt,
-        chosen_charts=chosen_charts_list,
-        schema=request.schema_definition
-    )
-    return data
+    builder = ChartValidatorAndQueryBuilder(charts_config)
+    final_result = await builder.build_final_charts(request.dataset_metadata, request.suggestions)
+    return final_result
 
 # --- Run the Application ---
-
 if __name__ == "__main__":
     print("Starting FastAPI server...")
-    print("API documentation will be available at http://127.0.0.1:8000/docs")
+    print("API documentation available at http://127.0.0.1:8000/docs")
     uvicorn.run(app, host="127.0.0.1", port=8000)
